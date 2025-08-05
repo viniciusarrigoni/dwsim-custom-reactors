@@ -1,0 +1,165 @@
+import os
+import csv
+import math
+from DWSIM.Thermodynamics import *
+
+# Parâmetros cinéticos
+k0 = 8.96096e-14  # mol/g·s·Pa²
+E = 4080  # J/mol
+R = 8.314  # J/mol·K
+
+# Constantes de adsorção
+A1, Ea1 = 2.18e-05, 910  # K1: CO
+A2, Ea2 = 3.95e-06, 1420  # K2: H2O
+A3, Ea3 = 4.64e-08, 24720  # K3: CO2
+A4, Ea4 = 5.13e-07, 14400  # K4: H2
+
+# Parâmetros do reator
+z = Comprimento_metro  # m
+D = Diametro_tubos_metro  # m
+t = Tubos  # número de tubos
+N = 1000  # divisões
+phi = 0.5
+rhoc = 5000000  # g/m³
+T_max = 683.15  # 410 °C
+
+# Massa total de catalisador (g)
+W_total = rhoc*(1 - phi)*z*math.pi*(D**2)/4
+dW = W_total/N
+
+# Corrente de entrada
+feed = ims1
+molflow_in = feed.GetProp("totalFlow", "Overall", None, "", "mole")[0]  # mol/s
+T_in = feed.GetProp("temperature", "Overall", None, "", "")[0]  # K
+P_in = feed.GetProp("pressure", "Overall", None, "", "")[0]  # Pa
+X_in = feed.GetProp("fraction", "Overall", None, "", "mole")
+
+# Verificar frações molares iniciais
+if X_in[0] == 0 or X_in[3] == 0:
+    Flowsheet.WriteMessage("Aviso: Fração molar inicial de CO ou H2O é zero. A reação WGS não ocorrerá.")
+
+# Inicializar fluxos
+F_CO = [molflow_in*X_in[0]/t]  # CO (mol/s por tubo)
+F_H2O = [molflow_in*X_in[3]/t]  # H2O
+F_CO2 = [molflow_in*X_in[2]/t]  # CO2
+F_H2 = [molflow_in*X_in[1]/t]  # H2
+F_CH4 = [molflow_in*X_in[4]/t]  # CH4 (inerte)
+T = [T_in]
+
+# Perfil com pressões parciais, temperatura e calor removido
+perfil = [["Massa Catalisador (g)", "F_CO (mol/s)", "F_H2O", "F_CO2", "F_H2", "F_CH4", "P_CO (bar)", "P_H2O (bar)", "P_CO2 (bar)", "P_H2 (bar)", "P_CH4 (bar)", "T (K)", "Q (J/g·s)"]]
+
+def get_Cp(component):
+    Cp_values = {
+        "CO": 29.1,   # J/mol·K
+        "H2O": 33.6,
+        "CO2": 37.1,
+        "H2": 28.8,
+        "CH4": 35.7   
+    }
+    return Cp_values.get(component)
+
+def r_LHHW(P_CO, P_H2O, P_CO2, P_H2, T):
+    k = k0*math.exp(-E/(R*T))
+    K1 = A1*math.exp(-Ea1/(R*T))
+    K2 = A2*math.exp(-Ea2/(R*T))
+    K3 = A3*math.exp(-Ea3/(R*T))
+    K4 = A4*math.exp(-Ea4/(R*T))
+    Ke = 100
+    numerator = k*(P_CO*P_H2O - P_CO2*P_H2/Ke)
+    denominator = (1 + K1*P_CO + K2*P_H2O + K3*P_CO2 + K4*P_H2)**2
+    return numerator/denominator  # mol/(g·s)
+
+# Entalpia de reação
+delta_Hr = -40000  # J/mol
+
+# Inicializar calor removido total (J/s por tubo)
+total_Q_tube = 0
+
+for i in range(N):
+    F_total = F_CO[-1] + F_H2O[-1] + F_CO2[-1] + F_H2[-1] + F_CH4[-1]
+    X_CO = F_CO[-1]/F_total if F_total > 0 else 0
+    X_H2O = F_H2O[-1]/F_total if F_total > 0 else 0
+    X_CO2 = F_CO2[-1]/F_total if F_total > 0 else 0
+    X_H2 = F_H2[-1]/F_total if F_total > 0 else 0
+    X_CH4 = F_CH4[-1]/F_total if F_total > 0 else 0
+
+    # Pressões parciais em Pa
+    P_CO = X_CO*P_in
+    P_H2O = X_H2O*P_in
+    P_CO2 = X_CO2*P_in
+    P_H2 = X_H2*P_in
+    P_CH4 = X_CH4*P_in
+    
+    r = r_LHHW(P_CO, P_H2O, P_CO2, P_H2, T[-1])
+    
+    # Capacidade calorífica total
+    Cp_total = (F_CO[-1]*get_Cp("CO") +
+                F_H2O[-1]*get_Cp("H2O") +
+                F_CO2[-1]*get_Cp("CO2") +
+                F_H2[-1]*get_Cp("H2") +
+                F_CH4[-1]*get_Cp("CH4"))
+    
+    # Balanço de energia com controle de temperatura
+    Q = 0
+    dT_dW = -r*delta_Hr/Cp_total if Cp_total > 0 else 0
+    T_next = T[-1] + dT_dW*dW
+    
+    if T_next >= T_max:
+        Q = -r*delta_Hr
+        T_next = T_max
+    
+    # Acumular calor removido (J/s por tubo)
+    total_Q_tube += Q*dW
+    
+    # Atualizar fluxos e temperatura
+    F_CO.append(F_CO[-1] - r*dW)
+    F_H2O.append(F_H2O[-1] - r*dW)
+    F_CO2.append(F_CO2[-1] + r*dW)
+    F_H2.append(F_H2[-1] + r*dW)
+    F_CH4.append(F_CH4[-1])  # Inerte, fluxo constante
+    T.append(T_next)
+    
+    # Pressões parciais em bar
+    P_CO_bar = P_CO/100000
+    P_H2O_bar = P_H2O/100000
+    P_CO2_bar = P_CO2/100000
+    P_H2_bar = P_H2/100000
+    P_CH4_bar = P_CH4/100000
+    
+    perfil.append([round((i+1)*dW, 6), F_CO[-1], F_H2O[-1], F_CO2[-1], F_H2[-1], F_CH4[-1], P_CO_bar, P_H2O_bar, P_CO2_bar, P_H2_bar, P_CH4_bar, T[-1], Q])
+
+# Frações molares finais
+F_out = [F_CO[-1], F_H2[-1], F_CO2[-1], F_H2O[-1], F_CH4[-1]]
+F_total_out = sum(F_out)*t
+X_out = [fi/sum(F_out) for fi in F_out] if F_total_out > 0 else [0, 0, 0, 0, 0]
+
+# Atualizar corrente de saída material
+try:
+    out_stream = oms1
+    out_stream.Clear()
+    out_stream.SetProp("totalFlow", "Overall", None, "", "mole", [F_total_out])
+    out_stream.SetProp("fraction", "Overall", None, "", "mole", X_out)
+    out_stream.SetProp("temperature", "Overall", None, "", "", [T[-1]])
+    out_stream.SetProp("pressure", "Overall", None, "", "", [P_in - 0.49e5])
+except Exception as e:
+    Flowsheet.WriteMessage(f"Erro ao atualizar saída material: {str(e)}")
+
+# Atualizar corrente de saída de energia
+try:
+    energy_stream = oes1
+    total_Q = total_Q_tube * t  # J/s (W) para todos os tubos
+    energy_stream.EnergyFlow = total_Q/1000  # kW
+    Flowsheet.WriteMessage(f"Calor removido total: {total_Q:.2f} W")
+except Exception as e:
+    Flowsheet.WriteMessage(f"Erro ao atualizar corrente de energia: {str(e)}")
+
+# Salvar CSV
+documents = os.path.join(os.path.expanduser("~"), "Documents")
+try:
+    with open(os.path.join(documents, "saida_perfil_reator.csv"), mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerows(perfil)
+    Flowsheet.WriteMessage("Arquivo CSV salvo em: " + os.path.join(documents, "saida_perfil_reator.csv"))
+except Exception as e:
+    Flowsheet.WriteMessage(f"Erro ao salvar CSV: {str(e)}")
